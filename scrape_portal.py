@@ -367,11 +367,36 @@ async def run_playwright(url: str, slug: str, portal: str, staging_dir: Path) ->
 # FALLBACK: Chrome DevTools Protocol via requests (connect to live Edge)
 # ---------------------------------------------------------------------------
 
+def _launch_edge_debug() -> bool:
+    """Launch Edge in remote debug mode if not already running. Returns True if launched."""
+    import subprocess, time
+    edge_paths = [
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    ]
+    for edge in edge_paths:
+        if Path(edge).exists():
+            try:
+                subprocess.Popen([
+                    edge,
+                    f"--remote-debugging-port=9222",
+                    "--user-data-dir=%USERPROFILE%\\EdgeDebugProfile",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                time.sleep(3)  # Give Edge time to start
+                print("[CDP] Launched Edge in debug mode.", file=sys.stderr)
+                return True
+            except Exception as e:
+                print(f"[CDP] Failed to launch Edge: {e}", file=sys.stderr)
+    return False
+
+
 def run_cdp_fallback(url: str, slug: str, portal: str, staging_dir: Path) -> dict:
     """
     Connect to live Microsoft Edge on localhost:9222 using its existing session
     cookies. Navigate to the portal page and download PDFs via CDP.
-    Edge uses the identical Chromium debugging protocol as Chrome.
+    Automatically launches Edge in debug mode if not already running.
     """
     import requests
     import time
@@ -381,12 +406,18 @@ def run_cdp_fallback(url: str, slug: str, portal: str, staging_dir: Path) -> dic
 
     print(f"[CDP] Connecting to Edge on {EDGE_CDP_URL}...", file=sys.stderr)
 
-    # Get available targets
+    # Get available targets -- auto-launch Edge if not running
     try:
-        targets_resp = requests.get(f"{EDGE_CDP_URL}/json", timeout=10)
+        targets_resp = requests.get(f"{EDGE_CDP_URL}/json", timeout=5)
         targets = targets_resp.json()
-    except Exception as e:
-        raise RuntimeError(f"Cannot reach Edge on {EDGE_CDP_URL}: {e}")
+    except Exception:
+        print("[CDP] Edge not running, attempting to launch...", file=sys.stderr)
+        _launch_edge_debug()
+        try:
+            targets_resp = requests.get(f"{EDGE_CDP_URL}/json", timeout=10)
+            targets = targets_resp.json()
+        except Exception as e:
+            raise RuntimeError(f"Cannot reach Edge on {EDGE_CDP_URL}: {e}")
 
     if not targets:
         raise RuntimeError("No open tabs found in Edge. Open the portal in Edge first.")
@@ -541,11 +572,41 @@ async def run(url: str, slug: str, force_cdp: bool = False) -> dict:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--url", required=True)
+    parser.add_argument("--url", help="Portal URL to scrape")
     parser.add_argument("--slug", required=True)
     parser.add_argument("--force-cdp", action="store_true",
                         help="Skip Playwright and go straight to Edge CDP fallback")
+    parser.add_argument("--read-result", action="store_true",
+                        help="Read and print existing staging result (no scrape)")
     args = parser.parse_args()
+
+    if args.read_result:
+        staging_dir = STAGING_BASE / args.slug
+        out = {"slug": args.slug, "staging_exists": staging_dir.exists()}
+        if staging_dir.exists():
+            scrape_log = staging_dir / "scrape_log.json"
+            metadata = staging_dir / "metadata.json"
+            raw_pdfs = staging_dir / "raw_pdfs"
+            if scrape_log.exists():
+                out["scrape_log"] = json.loads(scrape_log.read_text())
+            if metadata.exists():
+                out["metadata"] = json.loads(metadata.read_text())
+            if raw_pdfs.exists():
+                pdfs = list(raw_pdfs.glob("*.pdf"))
+                out["pdf_files"] = [p.name for p in pdfs]
+                out["pdf_count"] = len(pdfs)
+            # Check creds
+            creds = Path.home() / ".openclaw" / "secrets" / "bid-portals.env"
+            out["creds_exist"] = creds.exists()
+            if creds.exists():
+                out["cred_keys"] = [l.split("=")[0] for l in creds.read_text().splitlines()
+                                    if "=" in l and not l.startswith("#")]
+        print(json.dumps(out, indent=2))
+        return
+
+    if not args.url:
+        print(json.dumps({"error": "--url required unless --read-result is set"}))
+        return
 
     result = asyncio.run(run(args.url, args.slug, force_cdp=args.force_cdp))
     print(json.dumps({"status": "ok" if result.get("pdf_count", 0) > 0 else "warn",
